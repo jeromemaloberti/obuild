@@ -253,6 +253,7 @@ let compile_directory taskIndex task task_context on_task_finish dag h =
     match t with
     | (CompileC _)         -> None
     | (CompileInterface _) -> None
+    | (LinkTarget _)       -> None
     | (CompileDirectory m) -> if hier_lvl m = (hier_lvl h + 1) then Some m else None
     | (CompileModule m)    -> if hier_lvl m = (hier_lvl h + 1) then Some m else None
   in
@@ -294,6 +295,128 @@ let compile_directory taskIndex task task_context on_task_finish dag h =
     Retry
   )
 
+let linkCStuffTarget bstate cstate clibName =
+    let soFile = cstate.compilation_builddir_c </> fn ("dll" ^ clibName ^ ".so") in
+    let aFile = cstate.compilation_builddir_c </> fn ("lib" ^ clibName ^ ".a") in
+    let libName = cstate.compilation_builddir_c </> fn clibName in
+    let cdepFiles = List.map (fun x -> cstate.compilation_builddir_c </> o_from_cfile x) cstate.compilation_csources in
+    if gconf.conf_ocamlmklib then
+      [(fun () -> runCLinking LinkingShared cdepFiles libName)]
+    else
+      (
+        [(fun () -> runCLinking LinkingShared cdepFiles soFile);
+         (fun () -> runAr aFile cdepFiles);
+	 (fun () -> runRanlib aFile)]
+      )
+
+let linkTarget taskIndex task task_context bstate on_task_finish dag =
+    let (cstate,target) = Hashtbl.find task_context task in
+    let compile_opts = Target.get_compilation_opts target in
+    let compiledTypes = Target.get_ocaml_compiled_types target in
+
+    let cbits = target.target_cbits in
+
+    let compiled = get_compilation_order cstate in
+    verbose Debug "  compilation order: %s\n" (Utils.showList "," hier_to_string compiled);
+
+    let selfDeps = Analyze.get_internal_library_deps bstate.bstate_config target in
+    verbose Debug "  self deps: %s\n" (Utils.showList "," lib_name_to_string selfDeps);
+    let selfLibDirs = List.map (fun dep -> Dist.getBuildDest (Dist.Target (LibName dep))) selfDeps in
+
+    let internal_cclibs =
+        if cstate.compilation_csources <> []
+            then [Target.get_target_clibname target]
+            else []
+        in
+    let cclibs = List.concat (List.map (fun (cpkg,_) -> List.map (fun x -> "-l" ^ x) (Analyze.get_c_pkg cpkg bstate.bstate_config).cpkg_conf_libs) cbits.target_cpkgs)
+               @ List.map (fun x -> "-L" ^ fp_to_string x) selfLibDirs
+               @ List.map (fun x -> "-l" ^ x) (cbits.target_clibs @ internal_cclibs)
+        in
+
+    let pkgDeps = Analyze.get_pkg_deps target bstate.bstate_config in
+    verbose Verbose "package deps: [%s]\n" (Utils.showList "," lib_name_to_string pkgDeps);
+
+    let useThreadLib =
+        if List.mem (lib_name_of_string "threads") pkgDeps
+        || List.mem (lib_name_of_string "threads.posix") pkgDeps
+            then WithThread
+            else NoThread
+        in
+    let useThreads = useThreadLib in
+
+    let cfunlist = 
+      if cstate.compilation_csources <> [] then (
+        let cname = Target.get_target_clibname target in
+        linkCStuffTarget bstate cstate cname;
+      ) else [] in
+    let funlist = if cfunlist <> [] then [cfunlist] else [] in
+    let funlist = List.fold_left (fun flist compiledType ->
+        List.fold_left (fun fs compileOpt ->
+            let buildDeps =
+                if is_target_lib target
+                    then []
+                    else
+                        list_filter_map (fun dep ->
+                            match Hashtbl.find bstate.bstate_config.project_dep_data dep with
+                            | Internal -> Some (in_current_dir (cmca_of_lib compiledType compileOpt dep))
+                            | System   ->
+                                let meta = Analyze.get_pkg_meta dep bstate.bstate_config in
+                                let pred =
+                                    match compiledType with
+                                    | Native    -> Meta.Pred_Native
+                                    | ByteCode  -> Meta.Pred_Byte
+                                    in
+                                let archives = Meta.getArchiveWithFilter meta dep pred in
+                                match archives with
+                                | []              -> None
+                                | archiveFile::_  -> Some (in_current_dir $ fn (snd archiveFile))
+                        ) pkgDeps
+                in
+
+            let dest =
+                match target.target_name with
+                | LibName libname ->
+                    cstate.compilation_builddir_ml Normal </> cmca_of_lib compiledType compileOpt libname
+                | _ ->
+                    let outputName = Utils.to_exe_name compileOpt 
+                                compiledType (Target.get_target_dest_name target) in
+                    cstate.compilation_builddir_ml Normal </> outputName
+                in
+            let linking_paths_of compileOpt =
+                match compileOpt with
+                | Normal    -> cstate.compilation_linking_paths
+                | WithDebug -> cstate.compilation_linking_paths_d
+                | WithProf  -> cstate.compilation_linking_paths_p
+                in
+
+            let destTime = Filesystem.getModificationTime dest in
+            let depsTime =
+                try Some (List.find (fun p -> destTime < Filesystem.getModificationTime p) (List.map (fun m -> cmc_of_hier compiledType (cstate.compilation_builddir_ml compileOpt)  m) compiled))
+                with Not_found -> None
+                in
+            if depsTime <> None then (
+	        let nbStep = Dag.length dag in
+		let nbStepLen = String.length (string_of_int nbStep) in
+                verbose Report "[%*d of %d] Linking %s %s\n%!" nbStepLen taskIndex nbStep (if is_target_lib target then "library" else "executable") (fp_to_string dest);
+
+		[(fun () -> runOcamlLinking
+                    (linking_paths_of compileOpt)
+                    compiledType
+                    (if is_target_lib target then LinkingLibrary else LinkingExecutable)
+                    compileOpt
+                    useThreads
+                    cclibs
+                    buildDeps
+                    compiled
+                    dest)] :: fs;
+            ) else fs
+        ) flist compile_opts
+    ) funlist compiledTypes in
+    if funlist <> [] then
+      AddTask (task, (List.rev funlist))
+    else
+      (on_task_finish task; Retry)
+
 (* compile will process the compilation DAG,
  * which will compile all C sources and OCaml modules.
  *)
@@ -305,7 +428,19 @@ let compile bstate targets =
 		 (Dag.getNodes cstate.compilation_dag);
     Dag.merge dag cstate.compilation_dag;
   ) targets;
-
+  let roots = Dag.getRoots dag in
+  List.iter (fun r -> 
+	     match r with 
+	     | CompileModule m -> 
+		Dag.addEdge (LinkTarget m) r dag;
+		let v = Hashtbl.find task_context r in
+		Hashtbl.add task_context (LinkTarget m) v 
+	     | CompileDirectory m -> 
+		Dag.addEdge (LinkTarget m) r dag;
+		let v = Hashtbl.find task_context r in
+		Hashtbl.add task_context (LinkTarget m) v 
+	    )
+	    roots;
   let taskdep = Taskdep.init dag in
 
   let on_task_finish task =
@@ -344,6 +479,7 @@ let compile bstate targets =
             | (CompileInterface m) -> compile_module taskIndex task task_context bstate on_task_finish dag true m
             | (CompileModule m)    -> compile_module taskIndex task task_context bstate on_task_finish dag false m
             | (CompileDirectory m) -> compile_directory taskIndex task task_context on_task_finish dag m
+            | (LinkTarget m) -> linkTarget taskIndex task task_context bstate on_task_finish dag
             in
         if Taskdep.isComplete taskdep
             then Terminate
@@ -355,119 +491,6 @@ let compile bstate targets =
     let stat = schedule gconf.conf_parallel_jobs schedule_idle schedule_finish in
     verbose Verbose "schedule finished: #processes=%d max_concurrency=%d\n" stat.nb_processes stat.max_runqueue;
     ()
-
-let linkCStuff bstate cstate clibName =
-    let soFile = cstate.compilation_builddir_c </> fn ("dll" ^ clibName ^ ".so") in
-    let aFile = cstate.compilation_builddir_c </> fn ("lib" ^ clibName ^ ".a") in
-    let libName = cstate.compilation_builddir_c </> fn clibName in
-    let cdepFiles = List.map (fun x -> cstate.compilation_builddir_c </> o_from_cfile x) cstate.compilation_csources in
-    if gconf.conf_ocamlmklib then
-      print_warnings (runCLinking LinkingShared cdepFiles libName)
-    else
-      (
-        print_warnings (runCLinking LinkingShared cdepFiles soFile);
-        print_warnings (runAr aFile cdepFiles);
-        print_warnings (runRanlib aFile)
-      )
-
-let linking bstate cstate target =
-    let compile_opts = Target.get_compilation_opts target in
-    let compiledTypes = Target.get_ocaml_compiled_types target in
-
-    let cbits = target.target_cbits in
-
-    let compiled = get_compilation_order cstate in
-    verbose Debug "  compilation order: %s\n" (Utils.showList "," hier_to_string compiled);
-
-    let selfDeps = Analyze.get_internal_library_deps bstate.bstate_config target in
-    verbose Debug "  self deps: %s\n" (Utils.showList "," lib_name_to_string selfDeps);
-    let selfLibDirs = List.map (fun dep -> Dist.getBuildDest (Dist.Target (LibName dep))) selfDeps in
-
-    let internal_cclibs =
-        if cstate.compilation_csources <> []
-            then [Target.get_target_clibname target]
-            else []
-        in
-    let cclibs = List.concat (List.map (fun (cpkg,_) -> List.map (fun x -> "-l" ^ x) (Analyze.get_c_pkg cpkg bstate.bstate_config).cpkg_conf_libs) cbits.target_cpkgs)
-               @ List.map (fun x -> "-L" ^ fp_to_string x) selfLibDirs
-               @ List.map (fun x -> "-l" ^ x) (cbits.target_clibs @ internal_cclibs)
-        in
-
-    let pkgDeps = Analyze.get_pkg_deps target bstate.bstate_config in
-    verbose Verbose "package deps: [%s]\n" (Utils.showList "," lib_name_to_string pkgDeps);
-
-    let useThreadLib =
-        if List.mem (lib_name_of_string "threads") pkgDeps
-        || List.mem (lib_name_of_string "threads.posix") pkgDeps
-            then WithThread
-            else NoThread
-        in
-    let useThreads = useThreadLib in
-
-    if cstate.compilation_csources <> [] then (
-        let cname = Target.get_target_clibname target in
-        linkCStuff bstate cstate cname;
-    );
-
-    List.iter (fun compiledType ->
-        List.iter (fun compileOpt ->
-            let buildDeps =
-                if is_target_lib target
-                    then []
-                    else
-                        list_filter_map (fun dep ->
-                            match Hashtbl.find bstate.bstate_config.project_dep_data dep with
-                            | Internal -> Some (in_current_dir (cmca_of_lib compiledType compileOpt dep))
-                            | System   ->
-                                let meta = Analyze.get_pkg_meta dep bstate.bstate_config in
-                                let pred =
-                                    match compiledType with
-                                    | Native    -> Meta.Pred_Native
-                                    | ByteCode  -> Meta.Pred_Byte
-                                    in
-                                let archives = Meta.getArchiveWithFilter meta dep pred in
-                                match archives with
-                                | []              -> None
-                                | archiveFile::_  -> Some (in_current_dir $ fn (snd archiveFile))
-                        ) pkgDeps
-                in
-
-            let dest =
-                match target.target_name with
-                | LibName libname ->
-                    cstate.compilation_builddir_ml Normal </> cmca_of_lib compiledType compileOpt libname
-                | _ ->
-                    let outputName = Utils.to_exe_name compileOpt compiledType (Target.get_target_dest_name target) in
-                    cstate.compilation_builddir_ml Normal </> outputName
-                in
-            let linking_paths_of compileOpt =
-                match compileOpt with
-                | Normal    -> cstate.compilation_linking_paths
-                | WithDebug -> cstate.compilation_linking_paths_d
-                | WithProf  -> cstate.compilation_linking_paths_p
-                in
-
-            let destTime = Filesystem.getModificationTime dest in
-            let depsTime =
-                try Some (List.find (fun p -> destTime < Filesystem.getModificationTime p) (List.map (fun m -> cmc_of_hier compiledType (cstate.compilation_builddir_ml compileOpt)  m) compiled))
-                with Not_found -> None
-                in
-            if depsTime <> None then (
-                verbose Report "Linking %s %s\n%!" (if is_target_lib target then "library" else "executable") (fp_to_string dest);
-
-                print_warnings (runOcamlLinking
-                    (linking_paths_of compileOpt)
-                    compiledType
-                    (if is_target_lib target then LinkingLibrary else LinkingExecutable)
-                    compileOpt
-                    useThreads
-                    cclibs
-                    buildDeps
-                    compiled
-                    dest)
-            )
-        ) compile_opts
-    ) compiledTypes
 
 let get_destination_files target =
     let compileOpts = Target.get_compilation_opts target in
@@ -495,7 +518,7 @@ let buildTarget bstate target modules =
     let buildDir = Dist.createBuildDest (Dist.Target target.target_name) in
     let cstate = prepare_target bstate buildDir target modules in
     compile bstate [(cstate, target, buildDir)];
-    linking bstate cstate target;
+ (*   linking bstate cstate target; *)
     sanity_check buildDir target;
     ()
 
@@ -545,7 +568,6 @@ let buildDag bstate projFile dag =
        ) tasks_list in
       compile bstate targets;
       List.iter (fun (c, t, b) ->
-	linking bstate c t;
 	sanity_check b t) targets;
   ) tasks
 

@@ -79,6 +79,7 @@ type compile_step = CompileModule    of hier
                   | CompileInterface of hier
                   | CompileDirectory of hier
                   | CompileC         of filename
+		  | LinkTarget       of hier
 
 let string_of_compile_step cs =
     match cs with
@@ -86,6 +87,7 @@ let string_of_compile_step cs =
     | CompileModule x    -> "mod " ^ (hier_to_string x)
     | CompileInterface x -> "intf " ^ (hier_to_string x)
     | CompileC x         -> "C " ^ (fn_to_string x)
+    | LinkTarget x        -> "link " ^ (hier_to_string x)
 
 (* represent a single compilation *)
 type compilation_state =
@@ -127,6 +129,7 @@ let get_compilation_order cstate =
         match t with
         | (CompileC _)         -> None
         | (CompileInterface _) -> None
+	| (LinkTarget _)          -> None
         | (CompileDirectory m) -> if hier_lvl m = 0 then Some m else None
         | (CompileModule m)    -> if hier_lvl m = 0 then Some m else None
         in

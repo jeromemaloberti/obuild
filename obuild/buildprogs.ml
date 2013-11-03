@@ -108,14 +108,10 @@ let runCCompile project dirSpec cflags file =
 
 let runAr dest deps =
     let args = [ Prog.getAR (); "rc"; fp_to_string dest ] @ List.map fp_to_string deps in
-    match run_with_outputs args with
-    | Success (_, warnings) -> warnings
-    | Failure er            -> raise (LinkingFailed er)
+    spawn args
 
 let runRanlib dest =
-    match run_with_outputs [ Prog.getRanlib (); fp_to_string dest ] with
-    | Success (_, warnings) -> warnings
-    | Failure er            -> raise (LinkingFailed er)
+    spawn [ Prog.getRanlib (); fp_to_string dest ]
 
 let runCLinking sharingMode depfiles dest =
     let args =
@@ -133,9 +129,7 @@ let runCLinking sharingMode depfiles dest =
           | LinkingShared -> ["-shared"]) (* TODO: fix this for all system != linux *)
         @ ["-o"; fp_to_string dest ]
         @ List.map fp_to_string depfiles in
-    match run_with_outputs args with
-    | Success (_, warnings) -> warnings
-    | Failure er            -> raise (LinkingFailed er)
+    spawn args
 
 let runOcamlLinking includeDirs buildMode linkingMode compileType useThread cclibs libs modules dest =
     let prog =
@@ -163,9 +157,6 @@ let runOcamlLinking includeDirs buildMode linkingMode compileType useThread ccli
                  | ByteCode -> if x.[1] = 'L' then "-cclib" else "-dllib") (* Ugly hack but do the job for now *)
                ; x ]) cclibs))
              @ (List.map fp_to_string $ List.map (cmc_of_hier buildMode currentDir) modules)
-             in
-    match run_with_outputs args with
-    | Success (_, warnings) -> warnings
-    | Failure er            -> raise (LinkingFailed er)
-
+    in
+    spawn args
 
