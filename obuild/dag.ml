@@ -145,6 +145,16 @@ let copy dag =
     List.iter (fun node -> copy_node node) nodes;
     dag2
 
+let merge dest src =
+    let nodes = Hashtbl.fold (fun k _ acc -> k :: acc) src.nodes [] in
+    let copy_node node =
+        addNode node dest;
+        let children = getChildren src node in
+        addChildrenEdges node children dest
+        in
+    List.iter (fun node -> copy_node node) nodes
+    
+
 (* o(v^3) use with care *)
 let transitive_reduction dag =
     let reducedDag = copy dag in
@@ -211,3 +221,29 @@ let toDot a_to_string name fromLeaf dag =
     
     append "}\n";
     Buffer.contents buf
+
+let ranked_dag dag =
+  let leaves = getLeaves dag in
+  let table = Hashtbl.create 16 in
+  let rec iter nodes rank =
+    let next = List.fold_left (fun a n ->
+        let parents = getParents dag n in
+	List.iter (fun p -> Hashtbl.replace table p rank) parents;
+	parents @ a) [] nodes in
+    if (List.length next) > 0 then
+      iter (Ext.Fugue.list_uniq next) (rank + 1)
+    else
+      rank
+  in
+  let max_rank = iter leaves 1 in
+  Printf.printf "max rank = %d dag size %d\n" max_rank (length dag);
+  let array = Array.make max_rank [] in
+  array.(0) <- leaves;
+  Hashtbl.iter (fun k v -> array.(v) <- k :: (array.(v))) table;
+  Array.iteri (fun i e -> Printf.printf "rank %d [%s]\n" i
+	         (String.concat ", " 
+		      (List.map Types.name_to_string e))) array;
+  Array.to_list array
+		      
+	       
+    

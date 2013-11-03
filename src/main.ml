@@ -86,12 +86,14 @@ let mainBuild argv =
                       let targets = List.map name_of_string !anon in
                       Dag.subset project.Analyze.project_targets_dag targets
               in
-    let taskdep = Taskdep.init dag in
+    Build.buildDag bstate projFile dag
+(*    let taskdep = Taskdep.init dag in
+    Dag.ranked_dag dag;
     while not (Taskdep.isComplete taskdep) do
         (match Taskdep.getnext taskdep with
         | None -> failwith "no free task in targets"
         | Some (step,ntask) ->
-            verbose Verbose "building target %s\n%!" (name_to_string ntask);
+            verbose Verbose "building target %s %d step\n%!" (name_to_string ntask) step;
             (match ntask with
             | ExeName name   -> Build.buildExe bstate (Project.find_exe projFile name)
             | LibName name   -> Build.buildLib bstate (Project.find_lib projFile name)
@@ -103,7 +105,7 @@ let mainBuild argv =
         )
     done;
     ()
-
+ *)
 let mainClean argv =
     if Filesystem.exists (Dist.getDistPath ())
         then Filesystem.removeDir (Dist.getDistPath ())
