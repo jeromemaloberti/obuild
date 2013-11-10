@@ -86,131 +86,140 @@ let reason_from_paths (_,dest) (srcTy,changedSrc) =
                 fp_to_string changedSrc ^ " changed"
         )
 
-(* add a OCaml module or interface compilation process *)
-let compile_module taskIndex task task_context bstate on_task_finish dag isIntf h =
-  let (cstate,target) = Hashtbl.find task_context task in
+let get_opts target h =
   let annotMode =
     if gconf.conf_annot && gconf.conf_bin_annot then AnnotationBoth
     else if gconf.conf_annot then AnnotationText
     else if gconf.conf_bin_annot then AnnotationBin
-    else AnnotationNone
-  in
+    else AnnotationNone in
   let compileOpts = Target.get_compilation_opts target in
   let packOpt = hier_parent h in
-  let hdesc =
-    let desc = Hashtbl.find cstate.compilation_modules h in
-    match desc.module_ty with
-    | DescFile z -> z
-    | DescDir _  -> failwith (sprintf "internal error compile module on directory (%s). steps dag internal error" (hier_to_string h))
-  in
-  let srcPath = path_dirname hdesc.module_src_path in
-  
-  let useThread = hdesc.module_use_threads in
-  let dirSpec =
-    { src_dir      = srcPath
-    ; dst_dir      = currentDir
-    ; include_dirs = [currentDir]
-    }
-  in
   let buildModes = Target.get_ocaml_compiled_types target in
+  (annotMode, compileOpts, packOpt, buildModes)
 
+let buildmode_to_filety bmode = if bmode = Native then FileCMX else FileCMO
+let buildmode_to_library_filety bmode = if bmode = Native then FileCMXA else FileCMA
+let get_internal_libs_paths selfDeps =
+  List.map (fun (compileOpt,compileType) ->
+            ((compileOpt,compileType), List.map (fun dep ->
+						 let dirname = Dist.getBuildDest (Dist.Target (LibName dep)) in
+						 let filety = buildmode_to_library_filety compileType in
+						 let libpath = dirname </> cmca_of_lib compileType compileOpt dep in
+						 (filety, libpath)
+						) selfDeps)
+           ) [ (Normal,Native);(Normal,ByteCode);(WithProf,Native);(WithProf,ByteCode);(WithDebug,Native);(WithDebug,ByteCode)]
+
+let get_dep_descs selfDeps isIntf hdesc cstate h compileOpts buildModes =
   let moduleDeps = hdesc.dep_cwd_modules in
-  
-  let buildmode_to_filety bmode = if bmode = Native then FileCMX else FileCMO in
-  let buildmode_to_library_filety bmode = if bmode = Native then FileCMXA else FileCMA in
+  let internalLibsPathsAllModes = get_internal_libs_paths selfDeps in
+  if isIntf
+  then (
+    let intfDesc =
+      match hdesc.module_intf_desc with
+      | None      -> failwith "assertion error, task interface and no module_intf"
+      | Some intf -> intf
+    in
+    List.map (fun compOpt ->
+              let dest = (FileCMI, cmi_of_hier (cstate.compilation_builddir_ml compOpt) h) in
+              let src  = [ (FileMLI, intfDesc.module_intf_path) ] in
+              let mDeps = List.map (fun moduleDep ->
+				    (FileCMI, cmi_of_hier (cstate.compilation_builddir_ml compOpt) moduleDep)
+				   ) moduleDeps in
+              let internalDeps = List.assoc (compOpt,ByteCode) internalLibsPathsAllModes in
+              (dest,Interface,compOpt, src @ internalDeps @ mDeps)
+             ) compileOpts
+  ) else (
+    (* TODO: need way to not do debug/profile per (native|bytecode) mode *)
+    let allModes = List.concat
+                     (List.map (fun compiledTy -> List.map (fun cmode -> (compiledTy, cmode)) compileOpts) buildModes)
+    in
+    List.map (fun (compiledTy, compOpt) ->
+              let fileCompileTy = buildmode_to_filety compiledTy in
+              let dest = (fileCompileTy, cmc_of_hier compiledTy (cstate.compilation_builddir_ml compOpt) h) in
+              let src  =
+                (match hdesc.module_intf_desc with None -> [] | Some intf -> [FileMLI,intf.module_intf_path])
+                @ [(FileML, hdesc.module_src_path)] in
+              let mDeps = List.concat (List.map (fun moduleDep ->
+						 [(fileCompileTy, cmc_of_hier compiledTy (cstate.compilation_builddir_ml compOpt) moduleDep)
+						 ;(FileCMI, cmi_of_hier (cstate.compilation_builddir_ml compOpt) moduleDep)
+						 ]
+						) moduleDeps) in
+              let internalDeps = List.assoc (compOpt,compiledTy) internalLibsPathsAllModes in
+              (dest,Compiled compiledTy,compOpt,src @ internalDeps @ mDeps)
+             ) allModes
+  )
 
-  let selfDeps = Analyze.get_internal_library_deps bstate.bstate_config target in
-  let internalLibsPathsAllModes =
-    List.map (fun (compileOpt,compileType) ->
-              ((compileOpt,compileType), List.map (fun dep ->
-						   let dirname = Dist.getBuildDest (Dist.Target (LibName dep)) in
-						   let filety = buildmode_to_library_filety compileType in
-						   let libpath = dirname </> cmca_of_lib compileType compileOpt dep in
-						   (filety, libpath)
-						  ) selfDeps)
-             ) [ (Normal,Native);(Normal,ByteCode);(WithProf,Native);(WithProf,ByteCode);(WithDebug,Native);(WithDebug,ByteCode)]
-	     
+
+(* add a OCaml module or interface compilation process *)
+let compile_module taskIndex task task_context bstate on_task_finish dag isIntf h =
+  let all = Hashtbl.find_all task_context task in
+  let process_one cstate target =
+    let (annotMode, compileOpts, packOpt, buildModes) = get_opts target h in
+    let hdesc =
+      let desc = Hashtbl.find cstate.compilation_modules h in
+      match desc.module_ty with
+      | DescFile z -> z
+      | DescDir _  -> failwith (sprintf "internal error compile module on directory (%s). steps dag internal error" (hier_to_string h))
+    in
+    let srcPath = path_dirname hdesc.module_src_path in
+    let useThread = hdesc.module_use_threads in
+    let dirSpec =
+      { src_dir      = srcPath
+      ; dst_dir      = currentDir
+      ; include_dirs = [currentDir]
+      }
+    in
+    let selfDeps = Analyze.get_internal_library_deps bstate.bstate_config target in
+    let depDescs = get_dep_descs selfDeps isIntf hdesc cstate h compileOpts buildModes in
+    let rec check invalid descs =
+      match descs with
+      | []                                  -> (None, [])
+      | (dest,buildMode,compOpt,srcs) :: xs ->
+	 let rDirSpec = { dirSpec with dst_dir = cstate.compilation_builddir_ml compOpt <//> hier_to_dirpath h
+                                     ; include_dirs = cstate.compilation_include_paths compOpt h } in
+	 let fcompile =
+           (buildMode,
+            (fun () -> runOcamlCompile rDirSpec useThread annotMode buildMode compOpt packOpt hdesc.module_use_pp hdesc.module_oflags h)) in
+	 if invalid
+	 then (
+           let (_, ys) = check invalid xs in
+           (Some "", fcompile :: ys)
+	 ) else (
+           match check_destination_valid_with srcs cstate dest with
+           | None            -> check false xs
+           | Some srcChanged ->
+              let reason = reason_from_paths dest srcChanged in
+              let (_, ys) = check true xs in
+              (Some reason, fcompile :: ys)
+	 )
+    in
+    (check false depDescs), hdesc 
   in
-  let depDescs =
-    if isIntf
-    then (
-      let intfDesc =
-        match hdesc.module_intf_desc with
-        | None      -> failwith "assertion error, task interface and no module_intf"
-        | Some intf -> intf
-      in
-      List.map (fun compOpt ->
-                let dest = (FileCMI, cmi_of_hier (cstate.compilation_builddir_ml compOpt) h) in
-                let src  = [ (FileMLI, intfDesc.module_intf_path) ] in
-                let mDeps = List.map (fun moduleDep ->
-				      (FileCMI, cmi_of_hier (cstate.compilation_builddir_ml compOpt) moduleDep)
-				     ) moduleDeps in
-                let internalDeps = List.assoc (compOpt,ByteCode) internalLibsPathsAllModes in
-                (dest,Interface,compOpt, src @ internalDeps @ mDeps)
-               ) compileOpts
-    ) else (
-      (* TODO: need way to not do debug/profile per (native|bytecode) mode *)
-      let allModes = List.concat
-                       (List.map (fun compiledTy -> List.map (fun cmode -> (compiledTy, cmode)) compileOpts) buildModes)
-      in
-      List.map (fun (compiledTy, compOpt) ->
-                let fileCompileTy = buildmode_to_filety compiledTy in
-                let dest = (fileCompileTy, cmc_of_hier compiledTy (cstate.compilation_builddir_ml compOpt) h) in
-                let src  =
-                  (match hdesc.module_intf_desc with None -> [] | Some intf -> [FileMLI,intf.module_intf_path])
-                  @ [(FileML, hdesc.module_src_path)] in
-                let mDeps = List.concat (List.map (fun moduleDep ->
-						   [(fileCompileTy, cmc_of_hier compiledTy (cstate.compilation_builddir_ml compOpt) moduleDep)
-						   ;(FileCMI, cmi_of_hier (cstate.compilation_builddir_ml compOpt) moduleDep)
-						   ]
-						  ) moduleDeps) in
-                let internalDeps = List.assoc (compOpt,compiledTy) internalLibsPathsAllModes in
-                (dest,Compiled compiledTy,compOpt,src @ internalDeps @ mDeps)
-               ) allModes
-    )
-  in
-  
-  let rec check invalid descs =
-    match descs with
-    | []                                  -> (None, [])
-    | (dest,buildMode,compOpt,srcs) :: xs ->
-       let rDirSpec = { dirSpec with dst_dir = cstate.compilation_builddir_ml compOpt <//> hier_to_dirpath h
-                                   ; include_dirs = cstate.compilation_include_paths compOpt h } in
-       let fcompile =
-         (buildMode,
-          (fun () -> runOcamlCompile rDirSpec useThread annotMode buildMode compOpt packOpt hdesc.module_use_pp hdesc.module_oflags h)) in
-       if invalid
-       then (
-         let (_, ys) = check invalid xs in
-         (Some "", fcompile :: ys)
-       ) else (
-         match check_destination_valid_with srcs cstate dest with
-         | None            -> check false xs
-         | Some srcChanged ->
-            let reason = reason_from_paths dest srcChanged in
-            let (_, ys) = check true xs in
-            (Some reason, fcompile :: ys)
-       )
-  in
-  let (compilationReason, checkFunList) = check false depDescs in
+  let all = List.map ( fun (c,t) -> process_one c t) all in
+  let ((compilationReason, checkFunList), hdesc) = List.hd all in
   match compilationReason with
   | None        -> on_task_finish task; Retry
   | Some reason ->
      (* if we module has an interface, we create one list, so everything can be run in parallel,
       * otherwise we partition the buildMode functions in buildModes group. *)
-     let funLists =
+     let funLists checkFunList hdesc =
        if isIntf || module_file_has_interface hdesc
        then [List.map snd checkFunList]
        else let (l1,l2) = List.partition (fun (x,_) -> x = Compiled Native) checkFunList in
             List.filter (fun x -> List.length x > 0) [List.map snd l1; List.map snd l2]
      in
+     let allFunLists = List.fold_left 
+			  (fun l ((_,checkFunList), hdesc) -> 
+			   let funlist = funLists checkFunList hdesc in
+			   l @ funlist) [] all in
      let verb = if isIntf then "Intfing" else "Compiling" in
      let nbStep = Dag.length dag in
      let nbStepLen = String.length (string_of_int nbStep) in
      verbose Report "[%*d of %d] %s %-.30s%s\n%!" nbStepLen taskIndex nbStep verb (hier_to_string h)
              (if reason <> "" then "    ( " ^ reason ^ " )" else "");
-     AddTask (task, funLists)
+     AddTask (task, allFunLists)
 
+	       
 (* add a C compilation process *)
 let compile_c taskIndex task task_context bstate on_task_finish dag cFile =
   let (cstate,target) = Hashtbl.find task_context task in
@@ -237,16 +246,7 @@ let compile_c taskIndex task task_context bstate on_task_finish dag cFile =
 (* compile a set of modules in directory into a pack *)
 let compile_directory taskIndex task task_context on_task_finish dag h =
   let (cstate,target) = Hashtbl.find task_context task in
-  let annotMode =
-    if gconf.conf_annot && gconf.conf_bin_annot then AnnotationBoth
-    else if gconf.conf_annot then AnnotationText
-    else if gconf.conf_bin_annot then AnnotationBin
-    else AnnotationNone
-  in
-  let packOpt = hier_parent h in
-  let compileOpts = Target.get_compilation_opts target in
-  let buildModes = Target.get_ocaml_compiled_types target in
-  
+  let (annotMode, compileOpts, packOpt, buildModes) = get_opts target h in  
   (* get all the modules defined at level h+1 *)
   let modulesTask = Taskdep.linearize cstate.compilation_dag Taskdep.FromParent [task] in
   let filterModules t : hier option =
