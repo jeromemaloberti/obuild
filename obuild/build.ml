@@ -349,7 +349,7 @@ let linkTarget taskIndex task task_context bstate on_task_finish dag =
         let cname = Target.get_target_clibname target in
         linkCStuffTarget bstate cstate cname;
       ) else [] in
-    let funlist = if cfunlist <> [] then [cfunlist] else [] in
+(*    let funlist = if cfunlist <> [] then [cfunlist] else [] in *)
     let funlist = List.fold_left (fun flist compiledType ->
         List.fold_left (fun fs compileOpt ->
             let buildDeps =
@@ -399,7 +399,7 @@ let linkTarget taskIndex task task_context bstate on_task_finish dag =
 		let nbStepLen = String.length (string_of_int nbStep) in
                 verbose Report "[%*d of %d] Linking %s %s\n%!" nbStepLen taskIndex nbStep (if is_target_lib target then "library" else "executable") (fp_to_string dest);
 
-		[(fun () -> runOcamlLinking
+		fs @ [(fun () -> runOcamlLinking
                     (linking_paths_of compileOpt)
                     compiledType
                     (if is_target_lib target then LinkingLibrary else LinkingExecutable)
@@ -408,12 +408,12 @@ let linkTarget taskIndex task task_context bstate on_task_finish dag =
                     cclibs
                     buildDeps
                     compiled
-                    dest)] :: fs;
+                    dest)]
             ) else fs
         ) flist compile_opts
-    ) funlist compiledTypes in
+    ) cfunlist compiledTypes in
     if funlist <> [] then
-      AddTask (task, (List.rev funlist))
+      AddTask (task, [funlist])
     else
       (on_task_finish task; Retry)
 
@@ -428,19 +428,6 @@ let compile bstate targets =
 		 (Dag.getNodes cstate.compilation_dag);
     Dag.merge dag cstate.compilation_dag;
   ) targets;
-  let roots = Dag.getRoots dag in
-  List.iter (fun r -> 
-	     match r with 
-	     | CompileModule m -> 
-		Dag.addEdge (LinkTarget m) r dag;
-		let v = Hashtbl.find task_context r in
-		Hashtbl.add task_context (LinkTarget m) v 
-	     | CompileDirectory m -> 
-		Dag.addEdge (LinkTarget m) r dag;
-		let v = Hashtbl.find task_context r in
-		Hashtbl.add task_context (LinkTarget m) v 
-	    )
-	    roots;
   let taskdep = Taskdep.init dag in
 
   let on_task_finish task =

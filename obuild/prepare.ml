@@ -79,7 +79,7 @@ type compile_step = CompileModule    of hier
                   | CompileInterface of hier
                   | CompileDirectory of hier
                   | CompileC         of filename
-		  | LinkTarget       of hier
+		  | LinkTarget       of target
 
 let string_of_compile_step cs =
     match cs with
@@ -87,7 +87,7 @@ let string_of_compile_step cs =
     | CompileModule x    -> "mod " ^ (hier_to_string x)
     | CompileInterface x -> "intf " ^ (hier_to_string x)
     | CompileC x         -> "C " ^ (fn_to_string x)
-    | LinkTarget x        -> "link " ^ (hier_to_string x)
+    | LinkTarget x        -> "link " ^ (Target.get_target_name x)
 
 (* represent a single compilation *)
 type compilation_state =
@@ -430,6 +430,16 @@ let prepare_target_ bstate buildDir target toplevelModules =
                     )
                 ) h;
             ) freeModules;
+	    let roots = Dag.getRoots stepsDag in
+	    List.iter (fun r -> 
+		       match r with 
+		       | CompileModule m -> 
+			  Dag.addEdge (LinkTarget target) r stepsDag;
+		       | CompileDirectory m -> 
+			  Dag.addEdge (LinkTarget target) r stepsDag;
+		       | _ -> ()
+	    )
+	    roots;
 
             hashtbl_modify_all (fun v -> List.filter (fun x -> not (List.mem x freeModules)) v) h;
             List.iter (Hashtbl.remove h) freeModules;
